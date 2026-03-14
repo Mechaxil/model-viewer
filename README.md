@@ -3,6 +3,8 @@
 Lightweight browser-based STL and STEP viewer built on Three.js.
 Drop it anywhere — GitHub Pages, a VPS, whatever and point it at a model file via URL param.
 
+Example:  [Setup](https://viewer.mechaxil.com/?flags=upload,edit)
+
 ## Usage
 ```
 viewer.html?file=https://raw.githubusercontent.com/you/repo/main/part.stl
