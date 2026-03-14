@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+<title>Mechaxil Viewer</title>
+
+<style>
+
+body{
+margin:0;
+background:#1b1b1b;
+color:white;
+font-family:Arial;
+overflow:hidden;
+}
+
+#toolbar{
+position:absolute;
+top:10px;
+left:10px;
+background:#2a2a2a;
+padding:10px;
+border-radius:6px;
+display:flex;
+flex-direction:column;
+gap:6px;
+}
+
+#stats{
+font-size:12px;
+margin-top:4px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div id="toolbar"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/occt-import-js@0.0.22/dist/occt-import-js.js"></script>
+
+<script type="module">
+
+import * as THREE from "https://esm.sh/three@0.160";
+import { OrbitControls } from "https://esm.sh/three@0.160/examples/jsm/controls/OrbitControls.js";
+import { TransformControls } from "https://esm.sh/three@0.160/examples/jsm/controls/TransformControls.js";
+import { STLLoader } from "https://esm.sh/three@0.160/examples/jsm/loaders/STLLoader.js";
+
+const params = new URLSearchParams(window.location.search);
+const fileURL = params.get("file");
+const flags = (params.get("flags") || "").split(",").map(x => x.trim());
+
+const enableUpload = flags.includes("upload");
+const enableEdit = flags.includes("edit");
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1b1b1b);
+
+const camera = new THREE.PerspectiveCamera(
+  60,
+  window.innerWidth/window.innerHeight,
+  0.1,
+  10000
+);
+camera.position.set(200,200,200);
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(window.innerWidth,window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera,renderer.domElement);
+controls.enableDamping=true;
+
+scene.add(new THREE.AmbientLight(0xffffff,0.6));
+
+const light = new THREE.DirectionalLight(0xffffff,0.8);
+light.position.set(1,1,1);
+scene.add(light);
+
+const grid = new THREE.GridHelper(300,30);
+scene.add(grid);
+
+const axes = new THREE.AxesHelper(50);
+axes.position.y = 0.1;
+scene.add(axes);
+
+const BUILD_VOLUME = {x:220,y:220,z:250};
+
+const buildBox = new THREE.LineSegments(
+  new THREE.EdgesGeometry(new THREE.BoxGeometry(BUILD_VOLUME.x,BUILD_VOLUME.z,BUILD_VOLUME.y)),
+  new THREE.LineBasicMaterial({color:0x00ff88})
+);
+buildBox.position.y = BUILD_VOLUME.z/2;
+scene.add(buildBox);
+
+const toolbar = document.getElementById("toolbar");
+
+let scaleInput = null;
+let confirmBtn = null;
+
+if(enableUpload){
+  const upload = document.createElement("input");
+  upload.type = "file";
+  upload.accept = ".stl,.step,.stp";
+  upload.onchange = async e => {
+    const file = e.target.files[0];
+    if(!file) return;
+    await loadBuffer(await file.arrayBuffer(), ext(file.name));
+  };
+  toolbar.appendChild(upload);
+}
+
+if(enableEdit){
+  scaleInput = document.createElement("input");
+  scaleInput.type = "number";
+  scaleInput.value = "1";
+  scaleInput.step = "0.01";
+  scaleInput.onchange = () => {
+    if(!mesh) return;
+    const s = parseFloat(scaleInput.value);
+    mesh.scale.set(s,s,s);
+    snapToBed();
+    updateStats();
+  };
+  toolbar.appendChild(scaleInput);
+
+  const autoBtn = document.createElement("button");
+  autoBtn.innerText = "Auto Orient";
+  autoBtn.onclick = autoOrient;
+  toolbar.appendChild(autoBtn);
+
+  confirmBtn = document.createElement("button");
+  confirmBtn.innerText = "Confirm";
+  confirmBtn.onclick = confirmTransform;
+  toolbar.appendChild(confirmBtn);
+}
+
+const stats = document.createElement("div");
+stats.id = "stats";
+toolbar.appendChild(stats);
+
+const stlLoader = new STLLoader();
+
+let mesh = null;
+let transform = null;
+let occtReady = null;
+
+function ext(url){
+  return url.split("?")[0].split(".").pop().toLowerCase();
+}
+
+// github.com/.../blob/... → raw.githubusercontent.com so fetch() works
+function toRawURL(url){
+  url = url.trim();
+  let m = url.match(/^https?:\/\/github\.com\/([^/]+\/[^/]+)\/blob\/(.+)$/);
+  if(m) return `https://raw.githubusercontent.com/${m[1]}/${m[2]}`;
+  m = url.match(/^https?:\/\/github\.com\/([^/]+\/[^/]+)\/raw\/(.+)$/);
+  if(m) return `https://raw.githubusercontent.com/${m[1]}/${m[2]}`;
+  return url;
+}
+
+function getOcct(){
+  if(!occtReady) occtReady = window.occtimportjs();
+  return occtReady;
+}
+
+function occtToGeometry(result){
+  if(!result.success || !result.meshes?.length) return null;
+
+  const allPos=[], allNor=[], allIdx=[];
+  let offset = 0;
+
+  for(const m of result.meshes){
+    const p = m.attributes.position.array;
+    const n = m.attributes.normal.array;
+    const idx = m.index.array;
+    for(let i=0;i<p.length;i++){ allPos.push(p[i]); allNor.push(n[i]); }
+    for(let i=0;i<idx.length;i++) allIdx.push(idx[i]+offset);
+    offset += p.length/3;
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(allPos),3));
+  geo.setAttribute("normal",   new THREE.BufferAttribute(new Float32Array(allNor),3));
+  geo.setIndex(new THREE.BufferAttribute(new Uint32Array(allIdx),1));
+  return geo;
+}
+
+async function loadBuffer(buffer, format){
+  if(format==="stl"){
+    loadGeometry(stlLoader.parse(buffer));
+  } else if(format==="step"||format==="stp"){
+    const occt = await getOcct();
+    const geo = occtToGeometry(occt.ReadStepFile(new Uint8Array(buffer), null));
+    if(geo) loadGeometry(geo);
+  }
+}
+
+function computeVolume(g){
+  const pos = g.attributes.position.array;
+  let v = 0;
+  for(let i=0;i<pos.length;i+=9){
+    const v0 = new THREE.Vector3(pos[i],  pos[i+1],pos[i+2]);
+    const v1 = new THREE.Vector3(pos[i+3],pos[i+4],pos[i+5]);
+    const v2 = new THREE.Vector3(pos[i+6],pos[i+7],pos[i+8]);
+    v += v0.dot(v1.clone().cross(v2));
+  }
+  return Math.abs(v/6);
+}
+
+function snapToBed(){
+  const box = new THREE.Box3().setFromObject(mesh);
+  mesh.position.y -= box.min.y;
+}
+
+function fitCamera(obj){
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const dist = Math.max(size.x,size.y,size.z)*2;
+  camera.position.set(dist,dist,dist);
+  controls.target.set(0,0,0);
+  controls.update();
+}
+
+function updateStats(){
+  if(!mesh) return;
+  const box = new THREE.Box3().setFromObject(mesh);
+  const size = box.getSize(new THREE.Vector3());
+  const tris = mesh.geometry.attributes.position.count/3;
+  const volume = computeVolume(mesh.geometry)/1000;
+  stats.innerHTML = `
+    X ${size.x.toFixed(2)} mm<br>
+    Y ${size.y.toFixed(2)} mm<br>
+    Z ${size.z.toFixed(2)} mm<br>
+    Triangles ${Math.round(tris)}<br>
+    Volume ${volume.toFixed(2)} cm³
+  `;
+}
+
+function loadGeometry(g){
+  g.computeVertexNormals();
+  g.center();
+
+  if(mesh) scene.remove(mesh);
+
+  mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+    color:0x00aaff,
+    metalness:0.1,
+    roughness:0.8
+  }));
+
+  scene.add(mesh);
+  snapToBed();
+  fitCamera(mesh);
+  if(enableEdit) setupTransform();
+  updateStats();
+}
+
+function setupTransform(){
+  transform = new TransformControls(camera,renderer.domElement);
+  transform.attach(mesh);
+  transform.setMode("rotate");
+  transform.addEventListener("dragging-changed", e => {
+    controls.enabled = !e.value;
+  });
+  transform.addEventListener("change", () => {
+    snapToBed();
+    updateStats();
+  });
+  scene.add(transform);
+}
+
+function autoOrient(){
+  if(!mesh) return;
+  const angles = [0,Math.PI/2,Math.PI,Math.PI*1.5];
+  let best=0, bestHeight=Infinity;
+  angles.forEach(a => {
+    mesh.rotation.set(0,a,0);
+    snapToBed();
+    const h = new THREE.Box3().setFromObject(mesh).getSize(new THREE.Vector3()).y;
+    if(h<bestHeight){ bestHeight=h; best=a; }
+  });
+  mesh.rotation.set(0,best,0);
+  snapToBed();
+  updateStats();
+}
+
+function confirmTransform(){
+  if(!mesh) return;
+  window.parent.postMessage({
+    type:"model_confirmed",
+    data:{
+      rotation:[mesh.rotation.x,mesh.rotation.y,mesh.rotation.z],
+      scale:mesh.scale.x
+    }
+  },"*");
+}
+
+if(fileURL){
+  const raw = toRawURL(fileURL);
+  fetch(raw)
+    .then(r => r.arrayBuffer())
+    .then(buf => loadBuffer(buf, ext(raw)));
+}
+
+window.addEventListener("message", async e => {
+  if(e.data?.type==="load_model"){
+    await loadBuffer(e.data.buffer, (e.data.ext||"stl").toLowerCase());
+  }
+});
+
+function animate(){
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene,camera);
+}
+
+animate();
+
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth,window.innerHeight);
+});
+
+</script>
+
+</body>
+</html>
